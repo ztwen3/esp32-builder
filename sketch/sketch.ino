@@ -7,12 +7,6 @@
 Preferences preferences;
 
 // =====================================================
-// DEFAULT WIFI NETWORK
-// =====================================================
-const char* WIFI_SSID     = "MDF";
-const char* WIFI_PASSWORD = "@irp0r7df2021";
-
-// =====================================================
 // DEVICE & CONFIG VARIABLES
 // =====================================================
 
@@ -34,8 +28,8 @@ const char* firebaseURL =
 // GPIO & PWM CONFIG
 // =====================================================
 
-#define BUTTON_HELP 2
-#define BUTTON_PC   4
+#define BUTTON_HELP 2   // الزر الأول: طلب مساعدة زبون
+#define BUTTON_PC   4   // الزر الثاني: طلب تفويض VOID / دعم فني
 
 #define GREEN_LED   18
 #define RED_LED     19
@@ -56,9 +50,10 @@ enum SystemState {
 
 SystemState currentState = STATE_IDLE;
 
-String currentAlertKey  = "";     // مفتاح البلاغ المفتوح في Firebase
-String reminderAlertKey = "";     // مفتاح البلاغ التذكيري الثاني
-bool secondMessageSent  = false;  // ضمان إرسال الرسالة الثانية مرة واحدة فقط
+String currentAlertKey  = "";        // مفتاح البلاغ المفتوح في Firebase
+String reminderAlertKey = "";        // مفتاح البلاغ التذكيري الثاني
+String activeAlertType  = "URGENT";  // نوع البلاغ الحالي (URGENT أو VOID)
+bool secondMessageSent  = false;     // ضمان إرسال الرسالة الثانية مرة واحدة فقط
 
 unsigned long alertStartTime = 0;
 const unsigned long SECOND_MSG_DELAY   = 45000; // الإرسال الثاني بعد 45 ثانية
@@ -274,15 +269,7 @@ void startConfigPortalWithTimeout() {
 
   wm.stopConfigPortal();
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long wifiWait = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 6000) {
-    delay(100);
-  }
-
+  WiFi.begin();
   flashAndFadeAllLeds();
 }
 
@@ -327,10 +314,7 @@ void monitorWiFi() {
   ledcWrite(YELLOW_LED, 0);
   digitalWrite(RED_LED, HIGH);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(50);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.reconnect();
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
@@ -403,22 +387,6 @@ bool sendToFirebase(const char* type, const char* message, bool isReminder = fal
   return false;
 }
 
-void resolveAlertInFirebase(const String& key) {
-  if (key == "" || WiFi.status() != WL_CONNECTED) return;
-
-  String patchURL = String(firebaseBaseURL) + "/alerts/" + key + ".json";
-  WiFiClientSecure patchClient;
-  patchClient.setInsecure();
-  HTTPClient patchHTTP;
-
-  if (patchHTTP.begin(patchClient, patchURL)) {
-    patchHTTP.addHeader("Content-Type", "application/json");
-    String body = "{\"status\":\"resolved\",\"apiKey\":\"" + String(apiKey) + "\"}";
-    patchHTTP.PATCH(body);
-    patchHTTP.end();
-  }
-}
-
 void checkAlertStatus() {
   if (currentAlertKey == "" || WiFi.status() != WL_CONNECTED) return;
 
@@ -483,13 +451,14 @@ void loop() {
   bool helpState = digitalRead(BUTTON_HELP);
   bool pcState   = digitalRead(BUTTON_PC);
 
-  // 1. عند ضغط زر طلب المساعدة
+  // 1. عند ضغط الزر الأول (Pin 2): طلب مساعدة زبون
   if (lastHelpState == HIGH && helpState == LOW) {
     unsigned long now = millis();
     if (now - lastHelpPress > BUTTON_DEBOUNCE) {
       lastHelpPress = now;
 
       if (sendToFirebase("URGENT", "Customer at counter requires support.", false)) {
+        activeAlertType = "URGENT";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
@@ -497,14 +466,18 @@ void loop() {
     }
   }
 
-  // 2. عند ضغط زر الحل / الإلغاء (إطفاء كل الأضواء فوراً وإغلاق البلاغ في التطبيق)
+  // 2. عند ضغط الزر الثاني (Pin 4): طلب تفويض إلغاء عملية VOID / الدعم الفني
   if (lastPcState == HIGH && pcState == LOW) {
     unsigned long now = millis();
     if (now - lastPcPress > BUTTON_DEBOUNCE) {
       lastPcPress = now;
-      if (currentAlertKey != "") resolveAlertInFirebase(currentAlertKey);
-      if (reminderAlertKey != "") resolveAlertInFirebase(reminderAlertKey);
-      resetSystemToIdle();
+
+      if (sendToFirebase("VOID", "Supervisor authorization needed for VOID.", false)) {
+        activeAlertType = "VOID";
+        currentState = STATE_WAITING;
+        alertStartTime = millis();
+        secondMessageSent = false;
+      }
     }
   }
 
@@ -514,7 +487,11 @@ void loop() {
   // 3. الرسالة التذكيرية الثانية تلقائياً عند التأخر (بعد 45 ثانية)
   if (currentState == STATE_WAITING && !secondMessageSent) {
     if (millis() - alertStartTime >= SECOND_MSG_DELAY) {
-      sendToFirebase("REMINDER", "Urgent! Second alert sent for pending customer.", true);
+      if (activeAlertType == "VOID") {
+        sendToFirebase("VOID", "Urgent! Second alert sent for pending VOID authorization.", true);
+      } else {
+        sendToFirebase("REMINDER", "Urgent! Second alert sent for pending customer.", true);
+      }
       secondMessageSent = true;
     }
   }
