@@ -9,6 +9,12 @@ Preferences preferences;
 Ticker ledTicker;
 
 // =====================================================
+// DEFAULT WIFI NETWORK
+// =====================================================
+const char* WIFI_SSID     = "MDF";
+const char* WIFI_PASSWORD = "@irp0r7df2021";
+
+// =====================================================
 // DEVICE & CONFIG VARIABLES
 // =====================================================
 
@@ -447,7 +453,7 @@ void startConfigPortalWithTimeout() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.begin();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long wifiWait = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 6000) {
@@ -475,7 +481,9 @@ void monitorWiFi() {
   digitalWrite(RED_LED, HIGH);
 
   WiFi.mode(WIFI_STA);
-  WiFi.reconnect();
+  WiFi.disconnect();
+  delay(50);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 4000) {
