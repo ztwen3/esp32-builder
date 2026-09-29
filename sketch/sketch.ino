@@ -15,15 +15,13 @@ const char* WIFI_PASSWORD = "@irp0r7df2021";
 // =====================================================
 // DEVICE & CONFIG VARIABLES
 // =====================================================
-
 char deviceID[32] = "PN012";         // Default Device ID
 const char* apPassword = "z1234567"; // AP Host Password
-const char* apiKey = "mdf@789789";   // مفتاح الأمان المطلوب للكتابة في Firebase
+const char* apiKey = "mdf@789789";   // مفتاح الأمان لقواعد Firebase
 
 // =====================================================
-// FIREBASE (الرابط النشط المتصل بالتطبيق)
+// FIREBASE
 // =====================================================
-
 const char* firebaseBaseURL =
   "https://esp32-alerts-d64e8-default-rtdb.firebaseio.com";
 
@@ -33,9 +31,8 @@ const char* firebaseURL =
 // =====================================================
 // GPIO & PWM CONFIG
 // =====================================================
-
 #define BUTTON_HELP 2   // الزر الأول: طلب مساعدة زبون
-#define BUTTON_PC   4   // الزر الثاني: طلب تفويض VOID / دعم فني
+#define BUTTON_PC   4   // الزر الثاني: طلب تفويض VOID
 
 #define GREEN_LED   18
 #define RED_LED     19
@@ -47,7 +44,6 @@ const char* firebaseURL =
 // =====================================================
 // SYSTEM STATES & TIMERS
 // =====================================================
-
 enum SystemState {
   STATE_IDLE,
   STATE_WAITING,   // الأخضر يومض (في انتظار استجابة)
@@ -57,18 +53,16 @@ enum SystemState {
 SystemState currentState = STATE_IDLE;
 
 String currentAlertKey  = "";        // مفتاح البلاغ المفتوح في Firebase
-String reminderAlertKey = "";        // مفتاح البلاغ التذكيري الثاني
 String activeAlertType  = "URGENT";  // نوع البلاغ الحالي (URGENT أو VOID)
-bool secondMessageSent  = false;     // ضمان إرسال الرسالة الثانية مرة واحدة فقط
+bool secondMessageSent  = false;     // ضمان تحديث التذكير مرة واحدة فقط
 
 unsigned long alertStartTime = 0;
-const unsigned long SECOND_MSG_DELAY   = 45000; // الإرسال الثاني بعد 45 ثانية
-const unsigned long TIMEOUT_AUTO_RESET = 60000; // مهلة دقيقة واحدة لإلغاء التنبيه تلقائياً
+const unsigned long SECOND_MSG_DELAY   = 45000;  // التذكير بعد 45 ثانية في نفس المكان
+const unsigned long TIMEOUT_AUTO_RESET = 300000; // مهلة 5 دقائق (300,000ms) لإلغاء التنبيه تلقائياً
 
 unsigned long lastFirebasePoll = 0;
-const unsigned long POLL_INTERVAL = 500;        // FAST MODE: فحص Firebase كل 500ms
+const unsigned long POLL_INTERVAL = 500;         // فحص Firebase كل 500ms
 
-// توقيتات أنماط الإضاءة
 unsigned long lastGreenBlink = 0;
 bool greenLedStatus = false;
 
@@ -76,17 +70,9 @@ int yellowBrightness = 0;
 int yellowFadeAmount = 5;
 unsigned long lastYellowFade = 0;
 
-// =====================================================
-// PERSISTENT HTTPS CONNECTION
-// =====================================================
-
 WiFiClientSecure firebaseClient;
 HTTPClient firebaseHTTP;
 bool firebaseReady = false;
-
-// =====================================================
-// BUTTON STATES & NETWORK TIMERS
-// =====================================================
 
 bool lastHelpState = HIGH;
 bool lastPcState   = HIGH;
@@ -95,27 +81,23 @@ unsigned long lastPcPress   = 0;
 const unsigned long BUTTON_DEBOUNCE = 200;
 
 unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 500;
+const unsigned long WIFI_CHECK_INTERVAL = 1000;
 bool reconnectingWiFi = false;
-unsigned long lastReconnectAttempt = 0;
-const unsigned long WIFI_RECONNECT_INTERVAL = 2000; // محاولة كل ثانيتين بدون تجميد loop
 
 // =====================================================
 // LED CONTROL & ANIMATIONS
 // =====================================================
-
 void allLedsOff() {
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(RED_LED, LOW);
-  ledcWrite(YELLOW_LED, 0); // إطفاء الأصفر تماماً عبر PWM
-  yellowBrightness = 0;     // تصفير قيمة السطوع للنمط التالي
+  ledcWrite(YELLOW_LED, 0);
+  yellowBrightness = 0;
   yellowFadeAmount = 5;
 }
 
 void resetSystemToIdle() {
   currentState = STATE_IDLE;
   currentAlertKey = "";
-  reminderAlertKey = "";
   secondMessageSent = false;
   allLedsOff();
   Serial.println("System reset to IDLE.");
@@ -138,7 +120,6 @@ void flashAndFadeAllLeds() {
     digitalWrite(GREEN_LED, LOW);
     delayMicroseconds((255 - i) * 4);
   }
-
   allLedsOff();
 }
 
@@ -149,7 +130,6 @@ void handleStateLEDs() {
       break;
 
     case STATE_WAITING:
-      // وميض الأخضر وإطفاء الباقي
       digitalWrite(RED_LED, LOW);
       ledcWrite(YELLOW_LED, 0);
       if (millis() - lastGreenBlink >= 400) {
@@ -160,7 +140,6 @@ void handleStateLEDs() {
       break;
 
     case STATE_RESPONDED:
-      // وميض الأصفر بالتلاشي البطيء (Breathing)
       digitalWrite(GREEN_LED, LOW);
       digitalWrite(RED_LED, LOW);
       if (millis() - lastYellowFade >= 25) {
@@ -177,54 +156,36 @@ void handleStateLEDs() {
 }
 
 // =====================================================
-// CONFIG PORTAL SETUP (DEVICE ID ONLY)
+// CONFIG PORTAL & FAST WIFI CONNECT
 // =====================================================
-
 void startConfigPortalWithTimeout() {
   WiFiManager wm;
-
   float tempC = temperatureRead();
   if (isnan(tempC) || tempC == 0) tempC = 41.8;
 
-  String customHead = 
+  String customHead =
     "<style>"
-    "body{background-color:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:15px;direction:rtl;}"
+    "body{background-color:#0d1117;color:#c9d1d9;font-family:sans-serif;margin:0;padding:15px;direction:rtl;}"
     "div.outer,.container,#wifi,#s,.msg{display:none!important;}"
-    "#custom-dashboard{display:block!important;max-width:380px;margin:10px auto;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,0.6);text-align:right;}"
+    "#custom-dashboard{display:block!important;max-width:380px;margin:10px auto;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;text-align:right;}"
     ".title{text-align:center;font-size:20px;font-weight:700;color:#58a6ff;margin-bottom:4px;}"
     ".subtitle{text-align:center;font-size:12px;color:#8b949e;margin-bottom:20px;}"
-    ".temp-box{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:12px 15px;margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;}"
-    ".temp-label{font-size:13px;color:#8b949e;font-weight:600;}"
-    ".temp-val{font-size:18px;font-weight:bold;color:#f0883e;direction:ltr;}"
-    ".form-group{margin-bottom:18px;}"
-    "label{display:block;font-size:12px;font-weight:600;color:#c9d1d9;margin-bottom:6px;}"
-    "input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;color:#f0f6fc;border-radius:6px;padding:12px;font-size:15px;outline:none;transition:0.2s;direction:ltr;text-align:left;}"
-    "input:focus{border-color:#58a6ff;box-shadow:0 0 0 3px rgba(88,166,255,0.15);}"
-    ".btn-save{width:100%;background:#238636;border:1px solid rgba(240,246,252,0.1);color:#ffffff;border-radius:6px;padding:12px;font-size:15px;font-weight:bold;cursor:pointer;margin-top:10px;transition:0.2s;}"
-    ".btn-save:hover{background:#2ea043;}"
+    ".temp-box{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:12px 15px;margin-bottom:18px;display:flex;justify-content:space-between;}"
+    "input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;color:#f0f6fc;border-radius:6px;padding:12px;font-size:15px;direction:ltr;}"
+    ".btn-save{width:100%;background:#238636;border:none;color:#fff;border-radius:6px;padding:12px;font-size:15px;font-weight:bold;cursor:pointer;margin-top:10px;}"
     "</style>"
-
     "<div id='custom-dashboard'>"
       "<div class='title'>إعدادات الجهاز</div>"
       "<div class='subtitle'>MDF AlertNet System</div>"
-
-      "<div class='temp-box'>"
-        "<span class='temp-label'>حرارة المعالج الداخلي:</span>"
-        "<span class='temp-val'>" + String(tempC, 1) + " &deg;C</span>"
-      "</div>"
-
+      "<div class='temp-box'><span>حرارة المعالج:</span><span>" + String(tempC, 1) + " &deg;C</span></div>"
       "<form action='/wifi' method='get'>"
-        "<div class='form-group'>"
-          "<label>رقم الجهاز (Device ID):</label>"
-          "<input type='text' name='device_id' value='" + String(deviceID) + "' placeholder='PN012' required>"
-        "</div>"
-
-        "<button type='submit' class='btn-save'>حفظ وخروج (Save & Exit)</button>"
+        "<label>رقم الجهاز (Device ID):</label>"
+        "<input type='text' name='device_id' value='" + String(deviceID) + "' required>"
+        "<button type='submit' class='btn-save'>حفظ وخروج</button>"
       "</form>"
     "</div>";
 
   wm.setCustomHeadElement(customHead.c_str());
-
   const char* menu[] = {"wifi"};
   wm.setMenu(menu, 1);
   wm.setConfigPortalBlocking(false);
@@ -237,18 +198,15 @@ void startConfigPortalWithTimeout() {
 
   while (true) {
     wm.process();
-
     if (wm.server->hasArg("device_id")) {
       String newDeviceID = wm.server->arg("device_id");
       newDeviceID.trim();
-
       if (newDeviceID.length() > 0) {
         preferences.begin("mdf-config", false);
         preferences.putString("deviceID", newDeviceID);
         preferences.end();
-
-        wm.server->send(200, "text/html", "<h2 style='color:#238636;text-align:center;font-family:sans-serif;'>تم حفظ الرقم بنجاح! جاري إعادة التشغيل...</h2>");
-        delay(1000);
+        wm.server->send(200, "text/html", "<h2 style='color:#238636;text-align:center;'>تم الحفظ! جاري إعادة التشغيل...</h2>");
+        delay(800);
         ESP.restart();
       }
     }
@@ -261,14 +219,12 @@ void startConfigPortalWithTimeout() {
 
     if (!clientConnected) {
       if (millis() - startTime >= 10000) break;
-
       if (millis() - lastStepTime >= 100) {
         lastStepTime = millis();
         allLedsOff();
         if (ledStep == 0) digitalWrite(RED_LED, HIGH);
         else if (ledStep == 1) ledcWrite(YELLOW_LED, 255);
         else if (ledStep == 2) digitalWrite(GREEN_LED, HIGH);
-
         ledStep = (ledStep + 1) % 3;
       }
     }
@@ -276,36 +232,32 @@ void startConfigPortalWithTimeout() {
   }
 
   wm.stopConfigPortal();
-
-  // FAST MODE: اتصال مباشر بشبكة MDF
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // لا ننتظر الاتصال هنا؛ loop سيبقى يعمل بدون تجميد
+  unsigned long wifiWait = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 8000) {
+    delay(100);
+  }
   flashAndFadeAllLeds();
 }
 
 // =====================================================
 // FIREBASE & NETWORK LOGIC
 // =====================================================
-
 bool initFirebase() {
   firebaseClient.setInsecure();
-  firebaseClient.setTimeout(1200);
-
+  firebaseClient.setTimeout(1500);
   if (!firebaseHTTP.begin(firebaseClient, firebaseURL)) {
     firebaseReady = false;
     return false;
   }
-
   firebaseHTTP.setReuse(true);
-  firebaseHTTP.setConnectTimeout(1200);
-  firebaseHTTP.setTimeout(2500);
+  firebaseHTTP.setConnectTimeout(1500);
+  firebaseHTTP.setTimeout(3000);
   firebaseHTTP.addHeader("Content-Type", "application/json");
-
   firebaseReady = true;
   return true;
 }
@@ -320,33 +272,27 @@ void closeFirebase() {
 void monitorWiFi() {
   if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
   lastWiFiCheck = millis();
+  if (WiFi.status() == WL_CONNECTED || reconnectingWiFi) return;
+
+  reconnectingWiFi = true;
+  closeFirebase();
+  digitalWrite(GREEN_LED, LOW);
+  ledcWrite(YELLOW_LED, 0);
+  digitalWrite(RED_LED, HIGH);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 4000) {
+    delay(100);
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
-    if (reconnectingWiFi) {
-      reconnectingWiFi = false;
-      digitalWrite(RED_LED, LOW);
-      initFirebase();
-      Serial.print("WiFi restored. IP: ");
-      Serial.println(WiFi.localIP());
-    }
-    return;
-  }
-
-  // الشبكة مقطوعة: لا نوقف loop ولا ننتظر 5 ثوانٍ
-  if (!reconnectingWiFi) {
-    reconnectingWiFi = true;
-    closeFirebase();
-    digitalWrite(GREEN_LED, LOW);
-    ledcWrite(YELLOW_LED, 0);
+    digitalWrite(RED_LED, LOW);
+    initFirebase();
+  } else {
     digitalWrite(RED_LED, HIGH);
   }
-
-  // محاولة إعادة الاتصال كل ثانيتين بشكل non-blocking
-  if (millis() - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
-    lastReconnectAttempt = millis();
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
+  reconnectingWiFi = false;
 }
 
 String jsonEscape(const char* text) {
@@ -365,7 +311,7 @@ String jsonEscape(const char* text) {
   return output;
 }
 
-bool sendToFirebase(const char* type, const char* message, bool isReminder = false) {
+bool sendToFirebase(const char* type, const char* message) {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (!firebaseReady && !initFirebase()) return false;
 
@@ -374,44 +320,71 @@ bool sendToFirebase(const char* type, const char* message, bool isReminder = fal
                 "\",\"location\":\"" + String(deviceID) +
                 "\",\"type\":\"" + String(type) +
                 "\",\"message\":\"" + jsonEscape(message) +
-                "\",\"status\":\"pending\",\"responder\":\"\",\"timestamp\":{\".sv\":\"timestamp\"}}";
+                "\",\"isReminder\":false,\"status\":\"pending\",\"responder\":\"\",\"timestamp\":{\".sv\":\"timestamp\"}}";
 
   int httpCode = firebaseHTTP.POST(json);
   if (httpCode <= 0) {
     closeFirebase();
-    if (initFirebase()) {
-      httpCode = firebaseHTTP.POST(json);
-    }
+    if (initFirebase()) httpCode = firebaseHTTP.POST(json);
   }
-
-  Serial.print("Firebase POST HTTP Code: ");
-  Serial.println(httpCode);
 
   if (httpCode == 200 || httpCode == 201) {
     String response = firebaseHTTP.getString();
-    int keyStart = response.indexOf("name\":\"") + 7;
+    int keyStart = response.indexOf("\"name\":\"") + 8;
     int keyEnd = response.indexOf("\"", keyStart);
-    if (keyStart > 6 && keyEnd > keyStart) {
-      String newKey = response.substring(keyStart, keyEnd);
-      if (isReminder) {
-        reminderAlertKey = newKey;
-      } else {
-        currentAlertKey = newKey;
-        reminderAlertKey = "";
-      }
+    if (keyStart > 7 && keyEnd > keyStart) {
+      currentAlertKey = response.substring(keyStart, keyEnd);
     }
     return true;
   }
   return false;
 }
 
+// تحديث نفس البلاغ لتغيير لونه وتفعيله كتذكير عاجل في نفس الخانة
+bool updateReminderInFirebase(const String& key, const char* message) {
+  if (key == "" || WiFi.status() != WL_CONNECTED) return false;
+
+  String patchURL = String(firebaseBaseURL) + "/alerts/" + key + ".json";
+  WiFiClientSecure patchClient;
+  patchClient.setInsecure();
+  patchClient.setTimeout(1500);
+  HTTPClient patchHTTP;
+
+  bool ok = false;
+  if (patchHTTP.begin(patchClient, patchURL)) {
+    patchHTTP.addHeader("Content-Type", "application/json");
+    String body = "{\"isReminder\":true,\"message\":\"" + jsonEscape(message) + "\",\"apiKey\":\"" + String(apiKey) + "\"}";
+    int code = patchHTTP.PATCH(body);
+    ok = (code == 200 || code == 204);
+    patchHTTP.end();
+  }
+  return ok;
+}
+
+void resolveAlertInFirebase(const String& key) {
+  if (key == "" || WiFi.status() != WL_CONNECTED) return;
+
+  String patchURL = String(firebaseBaseURL) + "/alerts/" + key + ".json";
+  WiFiClientSecure patchClient;
+  patchClient.setInsecure();
+  patchClient.setTimeout(1500);
+  HTTPClient patchHTTP;
+
+  if (patchHTTP.begin(patchClient, patchURL)) {
+    patchHTTP.addHeader("Content-Type", "application/json");
+    String body = "{\"status\":\"resolved\",\"apiKey\":\"" + String(apiKey) + "\"}";
+    patchHTTP.PATCH(body);
+    patchHTTP.end();
+  }
+}
+
 void checkAlertStatus() {
   if (currentAlertKey == "" || WiFi.status() != WL_CONNECTED) return;
 
   String checkURL = String(firebaseBaseURL) + "/alerts/" + currentAlertKey + "/status.json";
-
   WiFiClientSecure checkClient;
   checkClient.setInsecure();
+  checkClient.setTimeout(1500);
   HTTPClient checkHTTP;
 
   if (checkHTTP.begin(checkClient, checkURL)) {
@@ -433,10 +406,6 @@ void checkAlertStatus() {
   }
 }
 
-// =====================================================
-// SETUP & LOOP
-// =====================================================
-
 void setup() {
   Serial.begin(115200);
 
@@ -445,9 +414,7 @@ void setup() {
   pinMode(GREEN_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
 
-  // ربط الـ PWM لمنفذ الأصفر بتوافق مع ESP32 Core v3
   ledcAttach(YELLOW_LED, PWM_FREQ, PWM_RESOLUTION);
-
   allLedsOff();
 
   preferences.begin("mdf-config", false);
@@ -469,42 +436,30 @@ void loop() {
   bool helpState = digitalRead(BUTTON_HELP);
   bool pcState   = digitalRead(BUTTON_PC);
 
-  // 1. عند ضغط الزر الأول (Pin 2): طلب مساعدة زبون
+  // 1. الزر الأول (Pin 2): طلب مساعدة زبون
   if (lastHelpState == HIGH && helpState == LOW) {
     unsigned long now = millis();
     if (now - lastHelpPress > BUTTON_DEBOUNCE) {
       lastHelpPress = now;
-
-      // استجابة بصرية فورية قبل انتظار الشبكة
-      digitalWrite(GREEN_LED, HIGH);
-
-      if (sendToFirebase("URGENT", "Customer at counter requires support.", false)) {
+      if (sendToFirebase("URGENT", "Customer at counter requires support.")) {
         activeAlertType = "URGENT";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
-      } else {
-        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
 
-  // 2. عند ضغط الزر الثاني (Pin 4): طلب تفويض إلغاء عملية VOID / الدعم الفني
+  // 2. الزر الثاني (Pin 4): طلب تفويض VOID
   if (lastPcState == HIGH && pcState == LOW) {
     unsigned long now = millis();
     if (now - lastPcPress > BUTTON_DEBOUNCE) {
       lastPcPress = now;
-
-      // استجابة بصرية فورية قبل انتظار الشبكة
-      digitalWrite(GREEN_LED, HIGH);
-
-      if (sendToFirebase("VOID", "Supervisor authorization needed for VOID.", false)) {
+      if (sendToFirebase("VOID", "Supervisor authorization needed for VOID.")) {
         activeAlertType = "VOID";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
-      } else {
-        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
@@ -512,26 +467,27 @@ void loop() {
   lastHelpState = helpState;
   lastPcState   = pcState;
 
-  // 3. الرسالة التذكيرية الثانية تلقائياً عند التأخر (بعد 45 ثانية)
+  // 3. بعد 45 ثانية: تحديث نفس البلاغ لتغيير لونه في نفس المكان بدون إضافة خانة جديدة
   if (currentState == STATE_WAITING && !secondMessageSent) {
     if (millis() - alertStartTime >= SECOND_MSG_DELAY) {
       if (activeAlertType == "VOID") {
-        sendToFirebase("VOID", "Urgent! Second alert sent for pending VOID authorization.", true);
+        updateReminderInFirebase(currentAlertKey, "Urgent! Second alert sent for pending VOID authorization.");
       } else {
-        sendToFirebase("REMINDER", "Urgent! Second alert sent for pending customer.", true);
+        updateReminderInFirebase(currentAlertKey, "Urgent! Second alert sent for pending customer.");
       }
       secondMessageSent = true;
     }
   }
 
-  // 4. مؤقت الإلغاء التلقائي (العودة للوضع الطبيعي بعد 60 ثانية من بدء التنبيه)
+  // 4. مهلة 5 دقائق (300,000 مللي ثانية) لإلغاء التنبيه تلقائياً في حال عدم الاستجابة
   if (currentState != STATE_IDLE) {
     if (millis() - alertStartTime >= TIMEOUT_AUTO_RESET) {
+      resolveAlertInFirebase(currentAlertKey);
       resetSystemToIdle();
     }
   }
 
-  // 5. الاستعلام الدوري لمعرفة تغيير حالة البلاغ من تطبيق الهاتف
+  // 5. فحص حالة البلاغ كل 500ms
   if (currentState != STATE_IDLE && (millis() - lastFirebasePoll >= POLL_INTERVAL)) {
     lastFirebasePoll = millis();
     checkAlertStatus();
