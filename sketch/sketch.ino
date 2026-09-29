@@ -7,6 +7,12 @@
 Preferences preferences;
 
 // =====================================================
+// 24/7 FAST WIFI CONFIG
+// =====================================================
+const char* WIFI_SSID     = "MDF";
+const char* WIFI_PASSWORD = "@irp0r7df2021";
+
+// =====================================================
 // DEVICE & CONFIG VARIABLES
 // =====================================================
 
@@ -60,7 +66,7 @@ const unsigned long SECOND_MSG_DELAY   = 45000; // الإرسال الثاني �
 const unsigned long TIMEOUT_AUTO_RESET = 60000; // مهلة دقيقة واحدة لإلغاء التنبيه تلقائياً
 
 unsigned long lastFirebasePoll = 0;
-const unsigned long POLL_INTERVAL = 2000;       // استعلام Firebase كل ثانيتين
+const unsigned long POLL_INTERVAL = 500;        // FAST MODE: فحص Firebase كل 500ms
 
 // توقيتات أنماط الإضاءة
 unsigned long lastGreenBlink = 0;
@@ -89,8 +95,10 @@ unsigned long lastPcPress   = 0;
 const unsigned long BUTTON_DEBOUNCE = 200;
 
 unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 1000;
+const unsigned long WIFI_CHECK_INTERVAL = 500;
 bool reconnectingWiFi = false;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL = 2000; // محاولة كل ثانيتين بدون تجميد loop
 
 // =====================================================
 // LED CONTROL & ANIMATIONS
@@ -268,8 +276,15 @@ void startConfigPortalWithTimeout() {
   }
 
   wm.stopConfigPortal();
+
+  // FAST MODE: اتصال مباشر بشبكة MDF
   WiFi.mode(WIFI_STA);
-  WiFi.begin();
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // لا ننتظر الاتصال هنا؛ loop سيبقى يعمل بدون تجميد
   flashAndFadeAllLeds();
 }
 
@@ -279,7 +294,7 @@ void startConfigPortalWithTimeout() {
 
 bool initFirebase() {
   firebaseClient.setInsecure();
-  firebaseClient.setTimeout(1500);
+  firebaseClient.setTimeout(1200);
 
   if (!firebaseHTTP.begin(firebaseClient, firebaseURL)) {
     firebaseReady = false;
@@ -287,8 +302,8 @@ bool initFirebase() {
   }
 
   firebaseHTTP.setReuse(true);
-  firebaseHTTP.setConnectTimeout(1500);
-  firebaseHTTP.setTimeout(4000);
+  firebaseHTTP.setConnectTimeout(1200);
+  firebaseHTTP.setTimeout(2500);
   firebaseHTTP.addHeader("Content-Type", "application/json");
 
   firebaseReady = true;
@@ -306,29 +321,32 @@ void monitorWiFi() {
   if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
   lastWiFiCheck = millis();
 
-  if (WiFi.status() == WL_CONNECTED || reconnectingWiFi) return;
-
-  reconnectingWiFi = true;
-  closeFirebase();
-  digitalWrite(GREEN_LED, LOW);
-  ledcWrite(YELLOW_LED, 0);
-  digitalWrite(RED_LED, HIGH);
-
-  WiFi.reconnect();
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
-    delay(100);
+  if (WiFi.status() == WL_CONNECTED) {
+    if (reconnectingWiFi) {
+      reconnectingWiFi = false;
+      digitalWrite(RED_LED, LOW);
+      initFirebase();
+      Serial.print("WiFi restored. IP: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(RED_LED, LOW);
-    initFirebase();
-  } else {
+  // الشبكة مقطوعة: لا نوقف loop ولا ننتظر 5 ثوانٍ
+  if (!reconnectingWiFi) {
+    reconnectingWiFi = true;
+    closeFirebase();
+    digitalWrite(GREEN_LED, LOW);
+    ledcWrite(YELLOW_LED, 0);
     digitalWrite(RED_LED, HIGH);
   }
 
-  reconnectingWiFi = false;
+  // محاولة إعادة الاتصال كل ثانيتين بشكل non-blocking
+  if (millis() - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
+    lastReconnectAttempt = millis();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
 }
 
 String jsonEscape(const char* text) {
@@ -457,11 +475,16 @@ void loop() {
     if (now - lastHelpPress > BUTTON_DEBOUNCE) {
       lastHelpPress = now;
 
+      // استجابة بصرية فورية قبل انتظار الشبكة
+      digitalWrite(GREEN_LED, HIGH);
+
       if (sendToFirebase("URGENT", "Customer at counter requires support.", false)) {
         activeAlertType = "URGENT";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
+      } else {
+        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
@@ -472,11 +495,16 @@ void loop() {
     if (now - lastPcPress > BUTTON_DEBOUNCE) {
       lastPcPress = now;
 
+      // استجابة بصرية فورية قبل انتظار الشبكة
+      digitalWrite(GREEN_LED, HIGH);
+
       if (sendToFirebase("VOID", "Supervisor authorization needed for VOID.", false)) {
         activeAlertType = "VOID";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
+      } else {
+        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
