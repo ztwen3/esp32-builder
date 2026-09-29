@@ -3,20 +3,25 @@
 #include <HTTPClient.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
+#include <Ticker.h>
 
 Preferences preferences;
+Ticker ledTicker;
 
 // =====================================================
 // DEVICE & CONFIG VARIABLES
 // =====================================================
 
-char deviceID[32] = "PN012";         // Default Device ID
+char deviceID[32] = "PN012";            // Default Device ID
 const char* apPassword = "z1234567";    // AP Host Password
+const char* apiKey     = "mdf@789789";  // مفتاح الأمان المتوافق مع التطبيق وفايربيس
 
 // =====================================================
-// FIREBASE
+// FIREBASE CONFIG
 // =====================================================
 
+const char* firebaseBaseURL =
+  "https://mdf-2abd6-default-rtdb.europe-west1.firebasedatabase.app";
 const char* firebaseURL =
   "https://mdf-2abd6-default-rtdb.europe-west1.firebasedatabase.app/alerts.json";
 
@@ -31,7 +36,7 @@ const char* firebaseURL =
 #define RED_LED     19
 #define YELLOW_LED  21
 
-#define PWM_FREQ        5000
+#define PWM_FREQ       5000
 #define PWM_RESOLUTION 8
 
 // =====================================================
@@ -40,21 +45,23 @@ const char* firebaseURL =
 
 enum SystemState {
   STATE_IDLE,
-  STATE_WAITING,   // الأخضر يومض (في انتظار استجابة)
-  STATE_RESPONDED  // الأصفر يومض بالتلاشي (تمت الاستجابة)
+  STATE_WAITING,   // الأخضر يومض (في انتظار استجابة من التطبيق)
+  STATE_RESPONDED  // الأصفر يومض بالتلاشي Breathing (تمت الاستجابة من التطبيق)
 };
 
-SystemState currentState = STATE_IDLE;
+volatile SystemState currentState = STATE_IDLE;
+volatile bool portalModeActive = false;
 
-String currentAlertKey = "";     // مفتاح البلاغ المفتوح في Firebase
-bool secondMessageSent = false;  // ضمان إرسال الرسالة الثانية مرة واحدة فقط
+String currentAlertKey  = "";    // مفتاح البلاغ الأساسي في Firebase
+String reminderAlertKey = "";    // مفتاح البلاغ التذكيري الثاني (بعد 45 ثانية)
+bool secondMessageSent  = false; // ضمان إرسال الرسالة الثانية مرة واحدة فقط
 
 unsigned long alertStartTime = 0;
-const unsigned long SECOND_MSG_DELAY = 45000; // الإرسال الثاني بعد 45 ثانية
+const unsigned long SECOND_MSG_DELAY   = 45000; // الإرسال الثاني بعد 45 ثانية
 const unsigned long TIMEOUT_AUTO_RESET = 60000; // مهلة دقيقة واحدة لإلغاء التنبيه تلقائياً
 
 unsigned long lastFirebasePoll = 0;
-const unsigned long POLL_INTERVAL = 2000;    // استعلام Firebase كل ثانيتين
+const unsigned long POLL_INTERVAL = 1500;       // استعلام Firebase كل 1.5 ثانية
 
 // توقيتات أنماط الإضاءة
 unsigned long lastGreenBlink = 0;
@@ -98,36 +105,9 @@ void allLedsOff() {
   yellowFadeAmount = 5;
 }
 
-void resetSystemToIdle() {
-  currentState = STATE_IDLE;
-  currentAlertKey = "";
-  secondMessageSent = false;
-  allLedsOff();
-  Serial.println("System reset to IDLE.");
-}
-
-void flashAndFadeAllLeds() {
-  digitalWrite(RED_LED, HIGH);
-  ledcWrite(YELLOW_LED, 255);
-  digitalWrite(GREEN_LED, HIGH);
-  delay(120);
-
-  for (int i = 255; i >= 0; i -= 15) {
-    digitalWrite(RED_LED, HIGH);
-    ledcWrite(YELLOW_LED, i);
-    digitalWrite(GREEN_LED, HIGH);
-    delayMicroseconds(i * 4);
-
-    digitalWrite(RED_LED, LOW);
-    ledcWrite(YELLOW_LED, 0);
-    digitalWrite(GREEN_LED, LOW);
-    delayMicroseconds((255 - i) * 4);
-  }
-
-  allLedsOff();
-}
-
 void handleStateLEDs() {
+  if (portalModeActive || reconnectingWiFi) return;
+
   switch (currentState) {
     case STATE_IDLE:
       allLedsOff();
@@ -161,11 +141,212 @@ void handleStateLEDs() {
   }
 }
 
+void flashAndFadeAllLeds() {
+  portalModeActive = true;
+  digitalWrite(RED_LED, HIGH);
+  ledcWrite(YELLOW_LED, 255);
+  digitalWrite(GREEN_LED, HIGH);
+  delay(120);
+
+  for (int i = 255; i >= 0; i -= 15) {
+    digitalWrite(RED_LED, HIGH);
+    ledcWrite(YELLOW_LED, i);
+    digitalWrite(GREEN_LED, HIGH);
+    delayMicroseconds(i * 4);
+
+    digitalWrite(RED_LED, LOW);
+    ledcWrite(YELLOW_LED, 0);
+    digitalWrite(GREEN_LED, LOW);
+    delayMicroseconds((255 - i) * 4);
+  }
+
+  allLedsOff();
+  portalModeActive = false;
+}
+
 // =====================================================
-// CONFIG PORTAL SETUP (DEVICE ID ONLY)
+// FIREBASE & NETWORK LOGIC
+// =====================================================
+
+bool initFirebase() {
+  firebaseClient.setInsecure();
+  firebaseClient.setTimeout(2000);
+
+  firebaseHTTP.end();
+  if (!firebaseHTTP.begin(firebaseClient, firebaseURL)) {
+    firebaseReady = false;
+    return false;
+  }
+
+  firebaseHTTP.setReuse(true);
+  firebaseHTTP.setConnectTimeout(1500);
+  firebaseHTTP.setTimeout(3000);
+  firebaseHTTP.addHeader("Content-Type", "application/json");
+
+  firebaseReady = true;
+  return true;
+}
+
+void closeFirebase() {
+  if (firebaseReady) {
+    firebaseHTTP.end();
+    firebaseReady = false;
+  }
+}
+
+String jsonEscape(const char* text) {
+  String output;
+  output.reserve(strlen(text) + 20);
+  while (*text) {
+    char c = *text++;
+    switch (c) {
+      case '"':  output += "\\\""; break;
+      case '\\': output += "\\\\"; break;
+      case '\n': output += "\\n"; break;
+      case '\r': output += "\\r"; break;
+      default:   output += c; break;
+    }
+  }
+  return output;
+}
+
+String extractFirebaseKey(const String& response) {
+  int keyIdx = response.indexOf("\"name\"");
+  if (keyIdx < 0) return "";
+  int colonIdx = response.indexOf(':', keyIdx);
+  if (colonIdx < 0) return "";
+  int firstQuote = response.indexOf('"', colonIdx + 1);
+  if (firstQuote < 0) return "";
+  int secondQuote = response.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) return "";
+  return response.substring(firstQuote + 1, secondQuote);
+}
+
+bool sendToFirebase(const char* type, const char* message, bool isReminder = false) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!firebaseReady && !initFirebase()) return false;
+
+  String title = isReminder
+    ? ("⚠️ تذكير عاجل ثانٍ - تأخر الاستجابة (" + String(deviceID) + ")")
+    : ("🛎️ طلب القدوم لحل مشكلة زبون (" + String(deviceID) + ")");
+
+  String json = "{\"apiKey\":\"" + String(apiKey) +
+                "\",\"deviceID\":\"" + String(deviceID) +
+                "\",\"deviceId\":\"" + String(deviceID) +
+                "\",\"location\":\"" + String(deviceID) +
+                "\",\"type\":\"" + String(type) +
+                "\",\"title\":\"" + jsonEscape(title.c_str()) +
+                "\",\"message\":\"" + jsonEscape(message) +
+                "\",\"status\":\"pending\",\"responder\":\"\",\"timestamp\":{\".sv\":\"timestamp\"}}";
+
+  firebaseHTTP.setURL(firebaseURL);
+  firebaseHTTP.addHeader("Content-Type", "application/json");
+  int httpCode = firebaseHTTP.POST(json);
+
+  if (httpCode <= 0 && initFirebase()) {
+    httpCode = firebaseHTTP.POST(json);
+  }
+
+  if (httpCode == 200 || httpCode == 201) {
+    String response = firebaseHTTP.getString();
+    String newKey = extractFirebaseKey(response);
+    if (newKey.length() > 0) {
+      if (isReminder) {
+        reminderAlertKey = newKey; // حفظ مفتاح التذكير دون مسح المفتاح الأساسي
+      } else {
+        currentAlertKey = newKey;
+        reminderAlertKey = "";
+      }
+    }
+    return true;
+  }
+
+  if (httpCode > 0) firebaseHTTP.getString();
+  return false;
+}
+
+void resolveAlertInFirebase(const String& key) {
+  if (key.length() == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (!firebaseReady && !initFirebase()) return;
+
+  String patchURL = String(firebaseBaseURL) + "/alerts/" + key + ".json";
+  String body = "{\"status\":\"resolved\",\"apiKey\":\"" + String(apiKey) + "\"}";
+
+  firebaseHTTP.setURL(patchURL);
+  firebaseHTTP.addHeader("Content-Type", "application/json");
+  int code = firebaseHTTP.PATCH(body);
+  if (code > 0) firebaseHTTP.getString();
+  firebaseHTTP.setURL(firebaseURL);
+}
+
+void resetSystemToIdle(bool notifyServer = false) {
+  if (notifyServer) {
+    if (currentAlertKey.length() > 0) resolveAlertInFirebase(currentAlertKey);
+    if (reminderAlertKey.length() > 0) resolveAlertInFirebase(reminderAlertKey);
+  }
+  currentState = STATE_IDLE;
+  currentAlertKey = "";
+  reminderAlertKey = "";
+  secondMessageSent = false;
+  allLedsOff();
+  Serial.println("System reset to IDLE.");
+}
+
+String fetchSingleKeyStatus(const String& key) {
+  if (key.length() == 0 || WiFi.status() != WL_CONNECTED) return "";
+  if (!firebaseReady && !initFirebase()) return "";
+
+  String checkURL = String(firebaseBaseURL) + "/alerts/" + key + "/status.json";
+  firebaseHTTP.setURL(checkURL);
+  int code = firebaseHTTP.GET();
+  String status = "";
+  if (code == 200) {
+    status = firebaseHTTP.getString();
+    status.replace("\"", "");
+    status.trim();
+    status.toLowerCase();
+  } else if (code > 0) {
+    firebaseHTTP.getString();
+  } else {
+    initFirebase();
+  }
+  firebaseHTTP.setURL(firebaseURL);
+  return status;
+}
+
+void checkAlertStatus() {
+  if (currentAlertKey.length() == 0 && reminderAlertKey.length() == 0) return;
+
+  String status = fetchSingleKeyStatus(currentAlertKey);
+
+  // فحص مفتاح الرسالة التذكيرية أيضاً إن وُجدت
+  if (reminderAlertKey.length() > 0) {
+    String remStatus = fetchSingleKeyStatus(reminderAlertKey);
+    if (remStatus == "resolved" || remStatus == "completed" || remStatus == "closed" || remStatus == "done") {
+      status = remStatus;
+    } else if ((remStatus == "accepted" || remStatus == "in_progress" || remStatus == "seen") && status == "pending") {
+      status = remStatus;
+    }
+  }
+
+  if (status == "accepted" || status == "in_progress" || status == "seen") {
+    if (currentState != STATE_RESPONDED) {
+      currentState = STATE_RESPONDED;
+      Serial.println(">>> Alert ACCEPTED by staff! Yellow breathing LED active <<<");
+    }
+  } 
+  else if (status == "resolved" || status == "closed" || status == "completed" || status == "done" || status == "null") {
+    Serial.println(">>> Alert RESOLVED in app! Resetting to IDLE <<<");
+    resetSystemToIdle(false);
+  }
+}
+
+// =====================================================
+// CONFIG PORTAL SETUP (DEVICE ID + WIFI)
 // =====================================================
 
 void startConfigPortalWithTimeout() {
+  portalModeActive = true;
   WiFiManager wm;
 
   float tempC = temperatureRead();
@@ -223,7 +404,7 @@ void startConfigPortalWithTimeout() {
   while (true) {
     wm.process();
 
-    if (wm.server->hasArg("device_id")) {
+    if (wm.server && wm.server->hasArg("device_id")) {
       String newDeviceID = wm.server->arg("device_id");
       newDeviceID.trim();
 
@@ -261,43 +442,31 @@ void startConfigPortalWithTimeout() {
   }
 
   wm.stopConfigPortal();
+
+  // التبديل إلى وضع Station والاتصال بالشبكة المحفوظة
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin();
+
+  unsigned long wifiWait = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 6000) {
+    delay(100);
+  }
+
   flashAndFadeAllLeds();
-}
-
-// =====================================================
-// FIREBASE & NETWORK LOGIC
-// =====================================================
-
-bool initFirebase() {
-  firebaseClient.setInsecure();
-  firebaseClient.setTimeout(1500);
-
-  if (!firebaseHTTP.begin(firebaseClient, firebaseURL)) {
-    firebaseReady = false;
-    return false;
-  }
-
-  firebaseHTTP.setReuse(true);
-  firebaseHTTP.setConnectTimeout(1500);
-  firebaseHTTP.setTimeout(4000);
-  firebaseHTTP.addHeader("Content-Type", "application/json");
-
-  firebaseReady = true;
-  return true;
-}
-
-void closeFirebase() {
-  if (firebaseReady) {
-    firebaseHTTP.end();
-    firebaseReady = false;
-  }
+  portalModeActive = false;
 }
 
 void monitorWiFi() {
   if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
   lastWiFiCheck = millis();
 
-  if (WiFi.status() == WL_CONNECTED || reconnectingWiFi) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(RED_LED, LOW);
+    return;
+  }
+  if (reconnectingWiFi) return;
 
   reconnectingWiFi = true;
   closeFirebase();
@@ -305,10 +474,11 @@ void monitorWiFi() {
   ledcWrite(YELLOW_LED, 0);
   digitalWrite(RED_LED, HIGH);
 
+  WiFi.mode(WIFI_STA);
   WiFi.reconnect();
 
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 4000) {
     delay(100);
   }
 
@@ -320,70 +490,6 @@ void monitorWiFi() {
   }
 
   reconnectingWiFi = false;
-}
-
-String jsonEscape(const char* text) {
-  String output;
-  output.reserve(strlen(text) + 20);
-  while (*text) {
-    char c = *text++;
-    switch (c) {
-      case '"': output += "\\\""; break;
-      case '\\': output += "\\\\"; break;
-      case '\n': output += "\\n"; break;
-      case '\r': output += "\\r"; break;
-      default: output += c; break;
-    }
-  }
-  return output;
-}
-
-bool sendToFirebase(const char* type, const char* message) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (!firebaseReady && !initFirebase()) return false;
-
-  String json = "{\"deviceID\":\"" + String(deviceID) + "\",\"type\":\"" + String(type) +
-                "\",\"message\":\"" + jsonEscape(message) + "\",\"status\":\"pending\",\"responder\":\"\",\"timestamp\":{\".sv\":\"timestamp\"}}";
-
-  int httpCode = firebaseHTTP.POST(json);
-
-  if (httpCode == 200 || httpCode == 201) {
-    String response = firebaseHTTP.getString();
-    int keyStart = response.indexOf("name\":\"") + 7;
-    int keyEnd = response.indexOf("\"", keyStart);
-    if (keyStart > 6 && keyEnd > keyStart) {
-      currentAlertKey = response.substring(keyStart, keyEnd);
-    }
-    return true;
-  }
-  return false;
-}
-
-void checkAlertStatus() {
-  if (currentAlertKey == "" || WiFi.status() != WL_CONNECTED) return;
-
-  String checkURL = "https://mdf-2abd6-default-rtdb.europe-west1.firebasedatabase.app/alerts/" + currentAlertKey + "/status.json";
-
-  WiFiClientSecure checkClient;
-  checkClient.setInsecure();
-  HTTPClient checkHTTP;
-
-  if (checkHTTP.begin(checkClient, checkURL)) {
-    int code = checkHTTP.GET();
-    if (code == 200) {
-      String status = checkHTTP.getString();
-      status.replace("\"", "");
-      status.trim();
-
-      if (status == "accepted" || status == "in_progress") {
-        currentState = STATE_RESPONDED;
-      } 
-      else if (status == "resolved" || status == "closed") {
-        resetSystemToIdle();
-      }
-    }
-    checkHTTP.end();
-  }
 }
 
 // =====================================================
@@ -410,6 +516,9 @@ void setup() {
 
   startConfigPortalWithTimeout();
 
+  // تشغيل أنماط الإضاءة عبر مؤقت خلفي لضمان عدم التقطيع أثناء طلبات HTTP
+  ledTicker.attach_ms(25, handleStateLEDs);
+
   if (WiFi.status() == WL_CONNECTED) {
     initFirebase();
   }
@@ -417,7 +526,6 @@ void setup() {
 
 void loop() {
   monitorWiFi();
-  handleStateLEDs();
 
   bool helpState = digitalRead(BUTTON_HELP);
   bool pcState   = digitalRead(BUTTON_PC);
@@ -428,7 +536,7 @@ void loop() {
     if (now - lastHelpPress > BUTTON_DEBOUNCE) {
       lastHelpPress = now;
 
-      if (sendToFirebase("URGENT", "Customer at counter requires support.")) {
+      if (sendToFirebase("URGENT", "Customer at counter requires support.", false)) {
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
@@ -436,12 +544,12 @@ void loop() {
     }
   }
 
-  // 2. عند ضغط زر الحل / الإلغاء (إطفاء كل الأضواء فوراً)
+  // 2. عند ضغط زر الحل / الإلغاء (إغلاق البلاغ في التطبيق وإطفاء الأضواء فوراً)
   if (lastPcState == HIGH && pcState == LOW) {
     unsigned long now = millis();
     if (now - lastPcPress > BUTTON_DEBOUNCE) {
       lastPcPress = now;
-      resetSystemToIdle();
+      resetSystemToIdle(true);
     }
   }
 
@@ -451,15 +559,15 @@ void loop() {
   // 3. الرسالة التذكيرية الثانية تلقائياً عند التأخر (بعد 45 ثانية)
   if (currentState == STATE_WAITING && !secondMessageSent) {
     if (millis() - alertStartTime >= SECOND_MSG_DELAY) {
-      sendToFirebase("REMINDER", "Urgent! Second alert sent for pending customer.");
+      sendToFirebase("REMINDER", "Urgent! Second alert sent for pending customer.", true);
       secondMessageSent = true;
     }
   }
 
-  // 4. مؤقت الإلغاء التلقائي (العودة للوضع الطبيعي بعد 60 ثانية من بدء التنبيه في حال عدم الضغط على الزر)
+  // 4. مؤقت الإلغاء التلقائي (العودة للوضع الطبيعي بعد 60 ثانية من بدء التنبيه)
   if (currentState != STATE_IDLE) {
     if (millis() - alertStartTime >= TIMEOUT_AUTO_RESET) {
-      resetSystemToIdle();
+      resetSystemToIdle(false);
     }
   }
 
