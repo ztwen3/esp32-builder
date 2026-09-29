@@ -81,7 +81,9 @@ unsigned long lastPcPress   = 0;
 const unsigned long BUTTON_DEBOUNCE = 200;
 
 unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 1000;
+const unsigned long WIFI_CHECK_INTERVAL = 500;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL = 2000;
 bool reconnectingWiFi = false;
 
 // =====================================================
@@ -235,12 +237,8 @@ void startConfigPortalWithTimeout() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long wifiWait = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 8000) {
-    delay(100);
-  }
   flashAndFadeAllLeds();
 }
 
@@ -249,14 +247,14 @@ void startConfigPortalWithTimeout() {
 // =====================================================
 bool initFirebase() {
   firebaseClient.setInsecure();
-  firebaseClient.setTimeout(1500);
+  firebaseClient.setTimeout(1200);
   if (!firebaseHTTP.begin(firebaseClient, firebaseURL)) {
     firebaseReady = false;
     return false;
   }
   firebaseHTTP.setReuse(true);
-  firebaseHTTP.setConnectTimeout(1500);
-  firebaseHTTP.setTimeout(3000);
+  firebaseHTTP.setConnectTimeout(1200);
+  firebaseHTTP.setTimeout(2500);
   firebaseHTTP.addHeader("Content-Type", "application/json");
   firebaseReady = true;
   return true;
@@ -272,27 +270,29 @@ void closeFirebase() {
 void monitorWiFi() {
   if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
   lastWiFiCheck = millis();
-  if (WiFi.status() == WL_CONNECTED || reconnectingWiFi) return;
-
-  reconnectingWiFi = true;
-  closeFirebase();
-  digitalWrite(GREEN_LED, LOW);
-  ledcWrite(YELLOW_LED, 0);
-  digitalWrite(RED_LED, HIGH);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 4000) {
-    delay(100);
-  }
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(RED_LED, LOW);
-    initFirebase();
-  } else {
+    if (reconnectingWiFi) {
+      reconnectingWiFi = false;
+      digitalWrite(RED_LED, LOW);
+      initFirebase();
+    }
+    return;
+  }
+
+  if (!reconnectingWiFi) {
+    reconnectingWiFi = true;
+    closeFirebase();
+    digitalWrite(GREEN_LED, LOW);
+    ledcWrite(YELLOW_LED, 0);
     digitalWrite(RED_LED, HIGH);
   }
-  reconnectingWiFi = false;
+
+  if (millis() - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
+    lastReconnectAttempt = millis();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
 }
 
 String jsonEscape(const char* text) {
@@ -441,11 +441,14 @@ void loop() {
     unsigned long now = millis();
     if (now - lastHelpPress > BUTTON_DEBOUNCE) {
       lastHelpPress = now;
+      digitalWrite(GREEN_LED, HIGH);
       if (sendToFirebase("URGENT", "Customer at counter requires support.")) {
         activeAlertType = "URGENT";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
+      } else {
+        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
@@ -455,11 +458,14 @@ void loop() {
     unsigned long now = millis();
     if (now - lastPcPress > BUTTON_DEBOUNCE) {
       lastPcPress = now;
+      digitalWrite(GREEN_LED, HIGH);
       if (sendToFirebase("VOID", "Supervisor authorization needed for VOID.")) {
         activeAlertType = "VOID";
         currentState = STATE_WAITING;
         alertStartTime = millis();
         secondMessageSent = false;
+      } else {
+        digitalWrite(GREEN_LED, LOW);
       }
     }
   }
